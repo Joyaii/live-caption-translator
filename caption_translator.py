@@ -115,7 +115,7 @@ BAIDU_LANG = {"en": "en", "zh": "zh", "ja": "jp", "ko": "kor",
 BAIDU_ERR = {
     "52001": "请求超时，重试",
     "52002": "系统错误",
-    "52003": "appid 或密钥不对",
+    "52003": "appid 或密钥不对，或未开通该服务",
     "54000": "参数错误",
     "54001": "签名错误（检查密钥）",
     "54003": "调用频率超限（免费版 QPS=1）",
@@ -124,7 +124,13 @@ BAIDU_ERR = {
     "58000": "IP 不在白名单（后台设置里关掉或加上本机 IP）",
     "58001": "语言方向不支持",
     "58002": "服务已关闭",
+    "53001": "请求体格式错误",
 }
+
+# 大模型翻译的语境指令。不加的话 position 会翻成「姿势」、rotate 翻成「轮换」
+BAIDU_REFERENCE = ("这是FPS射击游戏的队友语音，翻译成简洁口语化的中文。"
+                   "注意：position 指位置/阵地（不是姿势），rotate 指转移/换点，"
+                   "flank 指侧翼/绕后，callout 用游戏通用说法。")
 
 
 class BaiduTranslator:
@@ -177,6 +183,7 @@ class BaiduTranslator:
             "salt": salt,
             "sign": self._sign(text, salt),
             "model_type": "llm",
+            "reference": BAIDU_REFERENCE,
         }
         if self.sess is not None:
             data = self.sess.post(self.LLM_URL, json=body, timeout=20).json()
@@ -189,8 +196,12 @@ class BaiduTranslator:
 
         code = str(data.get("error_code", ""))
         if code in ("0", "52000", ""):
-            d = data.get("data") or {}
-            tr = d.get("trans_result") or d.get("result") or d.get("dst") or ""
+            # 实测大模型接口的 trans_result 在顶层，和通用接口一致；
+            # 但文档示例里也有包在 data 下的情况，两处都兜一下
+            tr = data.get("trans_result")
+            if tr is None:
+                d = data.get("data") or {}
+                tr = d.get("trans_result") or d.get("result") or d.get("dst") or ""
             if isinstance(tr, list):
                 return "".join(x.get("dst", "") for x in tr)
             return str(tr)
