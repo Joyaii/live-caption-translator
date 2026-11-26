@@ -105,7 +105,7 @@ CAPTION_KEY = r"Software\Microsoft\LiveCaptions\UI"
 _SRC = {"lang": "en"}
 
 # 翻译引擎配置，跟着 settings.json 走
-CFG = {"engine": "bing", "baidu_appid": "", "baidu_key": ""}
+CFG = {"engine": "bing", "baidu_appid": "", "baidu_key": "", "baidu_apikey": ""}
 
 # 程序内部用两位语言码，百度用的是另一套（日语 jp、韩语 kor、法语 fra…）
 BAIDU_LANG = {"en": "en", "zh": "zh", "ja": "jp", "ko": "kor",
@@ -144,9 +144,10 @@ class BaiduTranslator:
     GENERAL_URL = "https://fanyi-api.baidu.com/api/trans/vip/translate"
     LLM_URL = "https://fanyi-api.baidu.com/ait/api/aiTextTranslate"
 
-    def __init__(self, appid, key):
+    def __init__(self, appid, key, apikey=""):
         self.appid = (appid or "").strip()
         self.key = (key or "").strip()
+        self.apikey = (apikey or "").strip()
         self.sess = None
         try:
             import requests
@@ -160,7 +161,8 @@ class BaiduTranslator:
 
     @property
     def ready(self):
-        return bool(self.appid and self.key)
+        # 大模型接口有 API Key 就够；通用接口只能用密钥算签名
+        return bool(self.appid) and (bool(self.apikey) or bool(self.key))
 
     def _sign(self, text, salt):
         raw = self.appid + text + str(salt) + self.key
@@ -181,16 +183,23 @@ class BaiduTranslator:
             "from": BAIDU_LANG.get(frm, frm),
             "to": to,
             "salt": salt,
-            "sign": self._sign(text, salt),
             "model_type": "llm",
             "reference": BAIDU_REFERENCE,
         }
+        headers = {"Content-Type": "application/json"}
+        if self.apikey:
+            # API Key 鉴权：不用算签名，百度推荐这种方式
+            headers["Authorization"] = f"Bearer {self.apikey}"
+        else:
+            body["sign"] = self._sign(text, salt)
+
         if self.sess is not None:
-            data = self.sess.post(self.LLM_URL, json=body, timeout=20).json()
+            data = self.sess.post(self.LLM_URL, json=body, headers=headers,
+                                  timeout=20).json()
         else:
             req = urllib.request.Request(
                 self.LLM_URL, data=json.dumps(body).encode("utf-8"),
-                headers={"Content-Type": "application/json"})
+                headers=headers)
             raw = self.opener.open(req, timeout=20).read().decode("utf-8", "ignore")
             data = json.loads(raw)
 
@@ -361,8 +370,10 @@ def get_baidu():
     """配置变了就重建，避免每次翻译新建 session。"""
     t = _BAIDU["t"]
     if (t is None or t.appid != CFG["baidu_appid"]
-            or t.key != CFG["baidu_key"]):
-        t = BaiduTranslator(CFG["baidu_appid"], CFG["baidu_key"])
+            or t.key != CFG["baidu_key"]
+            or t.apikey != CFG["baidu_apikey"]):
+        t = BaiduTranslator(CFG["baidu_appid"], CFG["baidu_key"],
+                            CFG["baidu_apikey"])
         _BAIDU["t"] = t
     return t
 
@@ -670,6 +681,7 @@ class Overlay:
             CFG["engine"] = "bing"
         CFG["baidu_appid"] = str(cfg.get("baidu_appid", "") or "")
         CFG["baidu_key"] = str(cfg.get("baidu_key", "") or "")
+        CFG["baidu_apikey"] = str(cfg.get("baidu_apikey", "") or "")
 
         sw = root.winfo_screenwidth()
         sh = root.winfo_screenheight()
@@ -710,6 +722,7 @@ class Overlay:
                 "engine": CFG["engine"],
                 "baidu_appid": CFG["baidu_appid"],
                 "baidu_key": CFG["baidu_key"],
+                "baidu_apikey": CFG["baidu_apikey"],
             })
         except Exception as exc:
             log_error(exc)
@@ -881,19 +894,23 @@ class Overlay:
         win.configure(bg=self.bg)
         win.attributes("-topmost", True)
         win.resizable(False, False)
-        win.geometry(f"470x260+{self._pos[0]}+{self._pos[1] + 90}")
+        win.geometry(f"490x350+{self._pos[0]}+{self._pos[1] + 90}")
 
         tk.Label(win,
-                 text="在 fanyi-api.baidu.com 注册后创建应用，把 APP ID 和密钥填进来。\n"
-                      "免费版每月 5 万字符，够日常游戏用。",
+                 text="在 fanyi-api.baidu.com 注册后创建应用。\n"
+                      "API Key 和「密钥」二选一即可，推荐 API Key。\n"
+                      "大模型翻译需在控制台单独开通。",
                  font=("Microsoft YaHei UI", 9), fg="#9aa0a6", bg=self.bg,
                  justify="left").pack(anchor="w", padx=18, pady=(14, 12))
 
-        for label, val, secret in (("APP ID", CFG["baidu_appid"], False),
-                                   ("密钥", CFG["baidu_key"], True)):
+        fields = {}
+        for label, val, fkey, secret in (
+                ("APP ID", CFG["baidu_appid"], "appid", False),
+                ("API Key", CFG["baidu_apikey"], "apikey", True),
+                ("密钥", CFG["baidu_key"], "key", True)):
             row = tk.Frame(win, bg=self.bg)
             row.pack(fill="x", padx=18, pady=4)
-            tk.Label(row, text=label, width=8, anchor="w",
+            tk.Label(row, text=label, width=9, anchor="w",
                      fg="#d0d0d0", bg=self.bg,
                      font=("Microsoft YaHei UI", 9)).pack(side="left")
             ent = tk.Entry(row, bg="#1f1f1f", fg="#e6e6e6",
@@ -901,22 +918,20 @@ class Overlay:
                            show="*" if secret else "")
             ent.insert(0, val)
             ent.pack(side="left", fill="x", expand=True, ipady=4)
-            if not secret:
-                e_appid = ent
-            else:
-                e_key = ent
+            fields[fkey] = ent
 
         msg = tk.Label(win, text="", fg="#ff8080", bg=self.bg,
                        font=("Microsoft YaHei UI", 9))
         msg.pack(anchor="w", padx=18, pady=(8, 0))
 
         def save():
-            CFG["baidu_appid"] = e_appid.get().strip()
-            CFG["baidu_key"] = e_key.get().strip()
+            CFG["baidu_appid"] = fields["appid"].get().strip()
+            CFG["baidu_apikey"] = fields["apikey"].get().strip()
+            CFG["baidu_key"] = fields["key"].get().strip()
             _CACHE.clear()
             _BAIDU["t"] = None
             if not get_baidu().ready:
-                msg.config(text="APP ID 和密钥都要填")
+                msg.config(text="APP ID 必填，API Key 和密钥至少填一个")
                 return
             self.engine_var.set("baidu_llm")
             CFG["engine"] = "baidu_llm"
@@ -938,7 +953,7 @@ class Overlay:
                   width=8).pack(side="left", padx=6)
 
         win.focus_force()
-        e_appid.focus_set()
+        fields["appid"].focus_set()
 
     def _toggle_caption(self):
         if not self.on_toggle_caption:
