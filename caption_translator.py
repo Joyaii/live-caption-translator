@@ -6,6 +6,7 @@
 
 import ctypes
 import difflib
+import hashlib
 import json
 import os
 import queue
@@ -102,6 +103,76 @@ LANG_NAMES = dict(LANGUAGES)
 CAPTION_KEY = r"Software\Microsoft\LiveCaptions\UI"
 # 识别语言决定翻译的源语言，改了要同步
 _SRC = {"lang": "en"}
+
+# 翻译引擎配置，跟着 settings.json 走
+CFG = {"engine": "bing", "baidu_appid": "", "baidu_key": ""}
+
+# 程序内部用两位语言码，百度用的是另一套（日语 jp、韩语 kor、法语 fra…）
+BAIDU_LANG = {"en": "en", "zh": "zh", "ja": "jp", "ko": "kor",
+              "fr": "fra", "de": "de", "es": "spa", "it": "it",
+              "pt": "pt", "da": "dan"}
+
+BAIDU_ERR = {
+    "52001": "请求超时，重试",
+    "52002": "系统错误",
+    "52003": "appid 或密钥不对",
+    "54000": "参数错误",
+    "54001": "签名错误（检查密钥）",
+    "54003": "调用频率超限（免费版 QPS=1）",
+    "54004": "账户余额不足",
+    "54005": "长文本请求频繁",
+    "58000": "IP 不在白名单（后台设置里关掉或加上本机 IP）",
+    "58001": "语言方向不支持",
+    "58002": "服务已关闭",
+}
+
+
+class BaiduTranslator:
+    """百度翻译开放平台。需要 appid + 密钥，免费版每月 5 万字符。"""
+
+    URL = "https://fanyi-api.baidu.com/api/trans/vip/translate"
+
+    def __init__(self, appid, key):
+        self.appid = (appid or "").strip()
+        self.key = (key or "").strip()
+        self.sess = None
+        try:
+            import requests
+            self.sess = requests.Session()
+        except Exception:
+            self.sess = None
+        self.cj = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.cj))
+        self.opener.addheaders = [("User-Agent", UA)]
+
+    @property
+    def ready(self):
+        return bool(self.appid and self.key)
+
+    def translate(self, text, frm="en", to="zh"):
+        if not self.ready:
+            raise RuntimeError("未配置百度 appid / 密钥")
+
+        salt = str(int(time.time() * 1000))
+        raw = self.appid + text + salt + self.key
+        sign = hashlib.md5(raw.encode("utf-8")).hexdigest()
+        params = {"q": text, "from": BAIDU_LANG.get(frm, frm), "to": to,
+                  "appid": self.appid, "salt": salt, "sign": sign}
+
+        if self.sess is not None:
+            resp = self.sess.get(self.URL, params=params, timeout=10)
+            data = resp.json()
+        else:
+            qs = urllib.parse.urlencode(params)
+            raw_resp = self.opener.open(f"{self.URL}?{qs}", timeout=10)
+            data = json.loads(raw_resp.read().decode("utf-8", "ignore"))
+
+        if "trans_result" in data:
+            return "".join(item.get("dst", "") for item in data["trans_result"])
+        code = str(data.get("error_code", ""))
+        msg = BAIDU_ERR.get(code) or data.get("error_msg") or code
+        raise RuntimeError(f"百度翻译失败：{msg}（{code}）")
 
 
 def read_caption_lang():
@@ -231,24 +302,50 @@ ENGINE = BingTranslator()
 
 _CACHE = {}
 _CACHE_MAX = 512
+_BAIDU = {"t": None}
+
+
+def get_baidu():
+    """配置变了就重建，避免每次翻译新建 session。"""
+    t = _BAIDU["t"]
+    if (t is None or t.appid != CFG["baidu_appid"]
+            or t.key != CFG["baidu_key"]):
+        t = BaiduTranslator(CFG["baidu_appid"], CFG["baidu_key"])
+        _BAIDU["t"] = t
+    return t
 
 
 def translate(text):
-    """带缓存的翻译。游戏里 callouts 高度重复，命中缓存就是 0 延迟。"""
+    """带缓存的翻译。引擎可在 Bing / 百度之间切换，百度失败会自动退回 Bing。"""
     if _SRC["lang"] == "zh":          # 识别语言本来就是中文，不用翻
         return text
-    key = f"{_SRC['lang']}|{text.strip().lower()}"
+
+    key = f"{CFG['engine']}|{_SRC['lang']}|{text.strip().lower()}"
     hit = _CACHE.get(key)
     if hit is not None:
         return hit
+
+    def remember(out):
+        if len(_CACHE) >= _CACHE_MAX:
+            _CACHE.pop(next(iter(_CACHE)))      # FIFO 淘汰
+        _CACHE[key] = out
+        return out
+
+    if CFG["engine"] == "baidu":
+        bt = get_baidu()
+        if bt.ready:
+            try:
+                out = bt.translate(text, _SRC["lang"], "zh").strip()
+                if out:
+                    return remember(out)
+            except Exception as exc:
+                log_error(exc)      # 失败就往下走 Bing，别让字幕空着
+
     for fn in (ENGINE.translate, mymemory):
         try:
             out = fn(text).strip()
             if out and out.lower() != text.lower():
-                if len(_CACHE) >= _CACHE_MAX:
-                    _CACHE.pop(next(iter(_CACHE)))      # FIFO 淘汰
-                _CACHE[key] = out
-                return out
+                return remember(out)
         except Exception:
             continue
     return "（翻译失败）"
@@ -515,6 +612,11 @@ class Overlay:
         cfg = load_settings()
         self.font_cn = _ci(cfg.get("font_cn"), 12, 44, 20)
         self.alpha = _cf(cfg.get("alpha"), 0.3, 1.0, ALPHA)
+        CFG["engine"] = cfg.get("engine", "bing")
+        if CFG["engine"] not in ("bing", "baidu"):
+            CFG["engine"] = "bing"
+        CFG["baidu_appid"] = str(cfg.get("baidu_appid", "") or "")
+        CFG["baidu_key"] = str(cfg.get("baidu_key", "") or "")
 
         sw = root.winfo_screenwidth()
         sh = root.winfo_screenheight()
@@ -552,6 +654,9 @@ class Overlay:
                 "font_cn": self.font_cn,
                 "width": self.w,
                 "pos": list(self._pos),
+                "engine": CFG["engine"],
+                "baidu_appid": CFG["baidu_appid"],
+                "baidu_key": CFG["baidu_key"],
             })
         except Exception as exc:
             log_error(exc)
@@ -634,6 +739,17 @@ class Overlay:
                 label=name, value=code, variable=self.lang_var,
                 command=lambda c=code: self._pick_lang(c))
         self.menu.add_cascade(label="识别语言", menu=self.lang_menu)
+
+        self.engine_var = tk.StringVar(value=CFG["engine"])
+        eng_menu = tk.Menu(self.menu, tearoff=0)
+        eng_menu.add_radiobutton(label="Bing（免注册）", value="bing",
+                                 variable=self.engine_var,
+                                 command=self._set_engine)
+        eng_menu.add_radiobutton(label="百度（需 appid）", value="baidu",
+                                 variable=self.engine_var,
+                                 command=self._set_engine)
+        self.menu.add_cascade(label="翻译引擎", menu=eng_menu)
+        self.menu.add_command(label="百度密钥…", command=self._baidu_dialog)
         self.menu.add_separator()
         self.menu.add_command(label="显示英文字幕窗", command=self._toggle_caption)
         self._cap_idx = self.menu.index("end")
@@ -694,6 +810,79 @@ class Overlay:
         self.lang_var.set(code)      # 程序调用时 Tk 不会自动更新变量
         if self.on_lang_change:
             self.on_lang_change(code)
+
+    def _set_engine(self):
+        CFG["engine"] = self.engine_var.get()
+        _CACHE.clear()
+        self._save()
+        if CFG["engine"] == "baidu" and not get_baidu().ready:
+            self.show_hint("百度引擎还没填 appid/密钥，右键「百度密钥…」设置",
+                           key="baidu_nokey")
+
+    def _baidu_dialog(self):
+        win = tk.Toplevel(self.root)
+        win.title("百度翻译 API 配置")
+        win.configure(bg=self.bg)
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        win.geometry(f"470x260+{self._pos[0]}+{self._pos[1] + 90}")
+
+        tk.Label(win,
+                 text="在 fanyi-api.baidu.com 注册后创建应用，把 APP ID 和密钥填进来。\n"
+                      "免费版每月 5 万字符，够日常游戏用。",
+                 font=("Microsoft YaHei UI", 9), fg="#9aa0a6", bg=self.bg,
+                 justify="left").pack(anchor="w", padx=18, pady=(14, 12))
+
+        for label, val, secret in (("APP ID", CFG["baidu_appid"], False),
+                                   ("密钥", CFG["baidu_key"], True)):
+            row = tk.Frame(win, bg=self.bg)
+            row.pack(fill="x", padx=18, pady=4)
+            tk.Label(row, text=label, width=8, anchor="w",
+                     fg="#d0d0d0", bg=self.bg,
+                     font=("Microsoft YaHei UI", 9)).pack(side="left")
+            ent = tk.Entry(row, bg="#1f1f1f", fg="#e6e6e6",
+                           insertbackground="#e6e6e6", relief="flat",
+                           show="*" if secret else "")
+            ent.insert(0, val)
+            ent.pack(side="left", fill="x", expand=True, ipady=4)
+            if not secret:
+                e_appid = ent
+            else:
+                e_key = ent
+
+        msg = tk.Label(win, text="", fg="#ff8080", bg=self.bg,
+                       font=("Microsoft YaHei UI", 9))
+        msg.pack(anchor="w", padx=18, pady=(8, 0))
+
+        def save():
+            CFG["baidu_appid"] = e_appid.get().strip()
+            CFG["baidu_key"] = e_key.get().strip()
+            _CACHE.clear()
+            _BAIDU["t"] = None
+            if not get_baidu().ready:
+                msg.config(text="APP ID 和密钥都要填")
+                return
+            self.engine_var.set("baidu")
+            CFG["engine"] = "baidu"
+            self._save()
+            win.destroy()
+            self.show_hint("已启用百度翻译", key="baidu_on")
+
+        def open_site():
+            import webbrowser
+            webbrowser.open("https://fanyi-api.baidu.com/manage/developer")
+
+        btns = tk.Frame(win, bg=self.bg)
+        btns.pack(pady=18)
+        tk.Button(btns, text="保存并启用", command=save,
+                  width=12).pack(side="left", padx=6)
+        tk.Button(btns, text="打开注册页", command=open_site,
+                  width=10).pack(side="left", padx=6)
+        tk.Button(btns, text="取消", command=win.destroy,
+                  width=8).pack(side="left", padx=6)
+
+        win.focus_force()
+        e_appid.focus_set()
 
     def _toggle_caption(self):
         if not self.on_toggle_caption:
