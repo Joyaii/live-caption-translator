@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# 运行时生成
+settings.json
+error.log
+trace.txt
+.caption_pos.json
+
+# 发布包
+*.zip
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
