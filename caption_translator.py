@@ -128,9 +128,15 @@ BAIDU_ERR = {
 
 
 class BaiduTranslator:
-    """百度翻译开放平台。需要 appid + 密钥，免费版每月 5 万字符。"""
+    """百度翻译。支持大模型翻译（llm）和传统机器翻译（nmt）。
 
-    URL = "https://fanyi-api.baidu.com/api/trans/vip/translate"
+    两条链路参数格式不一样：
+    - 通用接口走 GET，salt 是字符串
+    - 大模型接口走 POST JSON，salt 必须是数字（传字符串会报 53001）
+    """
+
+    GENERAL_URL = "https://fanyi-api.baidu.com/api/trans/vip/translate"
+    LLM_URL = "https://fanyi-api.baidu.com/ait/api/aiTextTranslate"
 
     def __init__(self, appid, key):
         self.appid = (appid or "").strip()
@@ -150,26 +156,61 @@ class BaiduTranslator:
     def ready(self):
         return bool(self.appid and self.key)
 
-    def translate(self, text, frm="en", to="zh"):
+    def _sign(self, text, salt):
+        raw = self.appid + text + str(salt) + self.key
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+    def translate(self, text, frm="en", to="zh", model="llm"):
         if not self.ready:
             raise RuntimeError("未配置百度 appid / 密钥")
+        if model == "llm":
+            return self._llm(text, frm, to)
+        return self._general(text, frm, to)
 
-        salt = str(int(time.time() * 1000))
-        raw = self.appid + text + salt + self.key
-        sign = hashlib.md5(raw.encode("utf-8")).hexdigest()
-        params = {"q": text, "from": BAIDU_LANG.get(frm, frm), "to": to,
-                  "appid": self.appid, "salt": salt, "sign": sign}
-
+    def _llm(self, text, frm, to):
+        salt = int(time.time() * 1000)
+        body = {
+            "appid": self.appid,
+            "q": text,
+            "from": BAIDU_LANG.get(frm, frm),
+            "to": to,
+            "salt": salt,
+            "sign": self._sign(text, salt),
+            "model_type": "llm",
+        }
         if self.sess is not None:
-            resp = self.sess.get(self.URL, params=params, timeout=10)
-            data = resp.json()
+            data = self.sess.post(self.LLM_URL, json=body, timeout=20).json()
+        else:
+            req = urllib.request.Request(
+                self.LLM_URL, data=json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json"})
+            raw = self.opener.open(req, timeout=20).read().decode("utf-8", "ignore")
+            data = json.loads(raw)
+
+        code = str(data.get("error_code", ""))
+        if code in ("0", "52000", ""):
+            d = data.get("data") or {}
+            tr = d.get("trans_result") or d.get("result") or d.get("dst") or ""
+            if isinstance(tr, list):
+                return "".join(x.get("dst", "") for x in tr)
+            return str(tr)
+        msg = BAIDU_ERR.get(code) or data.get("error_msg") or code
+        raise RuntimeError(f"百度大模型翻译失败：{msg}（{code}）")
+
+    def _general(self, text, frm, to):
+        salt = str(int(time.time() * 1000))
+        params = {"q": text, "from": BAIDU_LANG.get(frm, frm), "to": to,
+                  "appid": self.appid, "salt": salt,
+                  "sign": self._sign(text, salt)}
+        if self.sess is not None:
+            data = self.sess.get(self.GENERAL_URL, params=params, timeout=10).json()
         else:
             qs = urllib.parse.urlencode(params)
-            raw_resp = self.opener.open(f"{self.URL}?{qs}", timeout=10)
-            data = json.loads(raw_resp.read().decode("utf-8", "ignore"))
+            raw = self.opener.open(f"{self.GENERAL_URL}?{qs}", timeout=10)
+            data = json.loads(raw.read().decode("utf-8", "ignore"))
 
         if "trans_result" in data:
-            return "".join(item.get("dst", "") for item in data["trans_result"])
+            return "".join(i.get("dst", "") for i in data["trans_result"])
         code = str(data.get("error_code", ""))
         msg = BAIDU_ERR.get(code) or data.get("error_msg") or code
         raise RuntimeError(f"百度翻译失败：{msg}（{code}）")
@@ -331,11 +372,12 @@ def translate(text):
         _CACHE[key] = out
         return out
 
-    if CFG["engine"] == "baidu":
+    if CFG["engine"].startswith("baidu"):
         bt = get_baidu()
         if bt.ready:
+            model = "llm" if CFG["engine"] == "baidu_llm" else "nmt"
             try:
-                out = bt.translate(text, _SRC["lang"], "zh").strip()
+                out = bt.translate(text, _SRC["lang"], "zh", model).strip()
                 if out:
                     return remember(out)
             except Exception as exc:
@@ -613,7 +655,7 @@ class Overlay:
         self.font_cn = _ci(cfg.get("font_cn"), 12, 44, 20)
         self.alpha = _cf(cfg.get("alpha"), 0.3, 1.0, ALPHA)
         CFG["engine"] = cfg.get("engine", "bing")
-        if CFG["engine"] not in ("bing", "baidu"):
+        if CFG["engine"] not in ("bing", "baidu_llm", "baidu_nmt"):
             CFG["engine"] = "bing"
         CFG["baidu_appid"] = str(cfg.get("baidu_appid", "") or "")
         CFG["baidu_key"] = str(cfg.get("baidu_key", "") or "")
@@ -745,7 +787,10 @@ class Overlay:
         eng_menu.add_radiobutton(label="Bing（免注册）", value="bing",
                                  variable=self.engine_var,
                                  command=self._set_engine)
-        eng_menu.add_radiobutton(label="百度（需 appid）", value="baidu",
+        eng_menu.add_radiobutton(label="百度·大模型（需 appid）", value="baidu_llm",
+                                 variable=self.engine_var,
+                                 command=self._set_engine)
+        eng_menu.add_radiobutton(label="百度·机器翻译", value="baidu_nmt",
                                  variable=self.engine_var,
                                  command=self._set_engine)
         self.menu.add_cascade(label="翻译引擎", menu=eng_menu)
@@ -815,7 +860,7 @@ class Overlay:
         CFG["engine"] = self.engine_var.get()
         _CACHE.clear()
         self._save()
-        if CFG["engine"] == "baidu" and not get_baidu().ready:
+        if CFG["engine"].startswith("baidu") and not get_baidu().ready:
             self.show_hint("百度引擎还没填 appid/密钥，右键「百度密钥…」设置",
                            key="baidu_nokey")
 
@@ -862,8 +907,8 @@ class Overlay:
             if not get_baidu().ready:
                 msg.config(text="APP ID 和密钥都要填")
                 return
-            self.engine_var.set("baidu")
-            CFG["engine"] = "baidu"
+            self.engine_var.set("baidu_llm")
+            CFG["engine"] = "baidu_llm"
             self._save()
             win.destroy()
             self.show_hint("已启用百度翻译", key="baidu_on")
