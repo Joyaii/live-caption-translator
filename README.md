@@ -28,7 +28,7 @@
 
 ### 方式一：下载可执行文件
 
-从 [Releases](../../releases) 下载 `实时字幕翻译_v1.0.zip`，解压后双击 `实时字幕翻译.exe`。
+从 [Releases](../../releases/latest) 下载 `live-caption-translator-v1.0.zip`，解压后双击 `实时字幕翻译.exe`。
 
 首次运行可能遇到两个提示，都不是病毒：
 
